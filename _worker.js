@@ -795,6 +795,14 @@ async function UsagePanel管理面板(TOKEN) {
 
         * { box-sizing: border-box; margin: 0; padding: 0; }
 
+        html {
+            scrollbar-gutter: stable both-edges;
+        }
+
+        @supports not (scrollbar-gutter: stable) {
+            html { overflow-y: scroll; }
+        }
+
         body {
             font-family: 'Outfit', sans-serif;
             background-color: var(--background);
@@ -941,14 +949,21 @@ async function UsagePanel管理面板(TOKEN) {
         .mini-label { font-size: 0.7rem; text-transform: uppercase; color: var(--text-muted); margin-bottom: 0; letter-spacing: 0.05em; font-weight: 500; }
         .mini-value { font-size: 1.25rem; font-weight: 700; color: var(--text-main); line-height: 1.2; }
         .total-text { text-align: right; font-size: 0.8rem; color: var(--text-muted); margin-top: 0.5rem; }
-        .quota-details { margin-top: 1.25rem; }
+        .quota-details { margin-top: 1.25rem; overflow: hidden; }
+        .quota-details[open] { display: flex; flex-direction: column; }
+        .quota-details.quota-animating .quota-summary { pointer-events: none; }
         .quota-summary { list-style: none; background: var(--item-bg); border: 1px solid var(--stroke); border-radius: 14px; padding: 0.85rem 1rem; cursor: pointer; display: flex; justify-content: space-between; gap: 1rem; align-items: center; color: var(--text-main); font-size: 0.85rem; font-weight: 600; transition: all 0.3s ease; }
         .quota-summary::-webkit-details-marker { display: none; }
         .quota-summary:hover { border-color: var(--primary); background: rgba(99, 102, 241, 0.08); }
         .quota-summary::after { content: '展开'; color: var(--text-muted); font-size: 0.75rem; font-weight: 500; }
         .quota-details[open] .quota-summary::after { content: '收起'; }
+        .quota-details[open] .quota-summary { order: 2; margin-top: 0.875rem; }
         .quota-summary-meta { color: var(--text-muted); font-size: 0.75rem; font-weight: 500; }
+        .quota-body { overflow: hidden; }
+        .quota-details[open] .quota-body { order: 1; }
+        .quota-details.quota-animating .quota-body { will-change: height, opacity, transform; }
         .quota-list { display: grid; gap: 0.875rem; margin-top: 0.875rem; }
+        .quota-details[open] .quota-list { margin-top: 0; }
         .quota-item { background: var(--item-bg); border: 1px solid var(--stroke); border-radius: 14px; padding: 0.875rem 1rem; }
         .quota-group-head { display: flex; justify-content: space-between; gap: 0.75rem; align-items: center; margin-bottom: 0.75rem; }
         .quota-group-title { color: var(--text-main); font-size: 0.9rem; font-weight: 700; }
@@ -1547,7 +1562,7 @@ async function UsagePanel管理面板(TOKEN) {
             const r2 = resources.r2 || {};
             return '<details class="quota-details">' +
                 '<summary class="quota-summary"><span>资源额度细节</span><span class="quota-summary-meta">KV / D1 / R2</span></summary>' +
-                '<div class="quota-list">' +
+                '<div class="quota-body"><div class="quota-list">' +
                     renderQuotaGroup('KV', formatNumber(kv.namespaces || 0) + ' 个命名空间', [
                         renderQuotaBar('读取（今日）', kv.reads, kv.readsLimit),
                         renderQuotaBar('写入（今日）', kv.writes, kv.writesLimit),
@@ -1564,8 +1579,82 @@ async function UsagePanel管理面板(TOKEN) {
                         renderQuotaBar('Class B（本月）', r2.classB, r2.classBLimit),
                         renderQuotaBar('存储', r2.storageBytes, r2.storageLimitBytes, formatBytes)
                     ]) +
-                '</div><div class="resource-note">D1/KV 按 UTC 自然日统计，R2 操作按本月统计；存储为最近一次指标快照。</div>' +
+                '</div><div class="resource-note">D1/KV 按 UTC 自然日统计，R2 操作按本月统计；存储为最近一次指标快照。</div></div>' +
             '</details>';
+        }
+
+        function prefersReducedMotion() {
+            return window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        }
+
+        function resetQuotaBody(body) {
+            body.style.height = '';
+            body.style.opacity = '';
+            body.style.transform = '';
+            body.style.overflow = '';
+        }
+
+        function animateQuotaDetails(details, opening) {
+            const body = details.querySelector('.quota-body');
+            if (!body || typeof body.animate !== 'function') {
+                details.open = opening;
+                return;
+            }
+
+            details.classList.add('quota-animating');
+            body.style.overflow = 'hidden';
+
+            if (opening) {
+                details.open = true;
+                body.style.height = '0px';
+                body.style.opacity = '0';
+                body.style.transform = 'translateY(6px)';
+            } else {
+                body.style.height = body.scrollHeight + 'px';
+                body.style.opacity = '1';
+                body.style.transform = 'translateY(0)';
+            }
+
+            const startHeight = opening ? 0 : body.scrollHeight;
+            const endHeight = opening ? body.scrollHeight : 0;
+            const animation = body.animate([
+                { height: startHeight + 'px', opacity: opening ? 0 : 1, transform: opening ? 'translateY(6px)' : 'translateY(0)' },
+                { height: endHeight + 'px', opacity: opening ? 1 : 0, transform: opening ? 'translateY(0)' : 'translateY(6px)' }
+            ], {
+                duration: 260,
+                easing: 'cubic-bezier(0.4, 0, 0.2, 1)',
+                fill: 'forwards'
+            });
+
+            animation.onfinish = () => {
+                animation.cancel();
+                if (!opening) details.open = false;
+                resetQuotaBody(body);
+                details.classList.remove('quota-animating');
+            };
+
+            animation.oncancel = () => {
+                resetQuotaBody(body);
+                details.classList.remove('quota-animating');
+            };
+        }
+
+        function bindQuotaDetailsAnimations(scope) {
+            if (!scope) return;
+            scope.querySelectorAll('.quota-details').forEach(details => {
+                if (details.dataset.quotaAnimationBound) return;
+                const summary = details.querySelector('.quota-summary');
+                const body = details.querySelector('.quota-body');
+                if (!summary || !body) return;
+
+                details.dataset.quotaAnimationBound = 'true';
+                summary.addEventListener('click', (event) => {
+                    if (prefersReducedMotion() || typeof body.animate !== 'function') return;
+                    event.preventDefault();
+                    if (details.classList.contains('quota-animating')) return;
+                    animateQuotaDetails(details, !details.open);
+                });
+            });
         }
 
         async function logout() {
@@ -1620,6 +1709,7 @@ async function UsagePanel管理面板(TOKEN) {
                     </div>
                     \${renderResourceQuotas(resources)}
                 \`;
+                bindQuotaDetailsAnimations(container);
                 
                 // 应用颜色到百分数
                 const usageSection = container.querySelector('.usage-section');
@@ -1675,6 +1765,7 @@ async function UsagePanel管理面板(TOKEN) {
                         </div>
                     \`;
                 }).join('') + '</div>';
+                bindQuotaDetailsAnimations(container);
             } catch (err) {
                 container.innerHTML = '<div style="color: var(--danger)">加载详情数据失败</div>';
             }
@@ -1830,6 +1921,14 @@ async function UsagePanel主页(TOKEN) {
         }
 
         * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        html {
+            scrollbar-gutter: stable both-edges;
+        }
+
+        @supports not (scrollbar-gutter: stable) {
+            html { overflow-y: scroll; }
+        }
 
         body {
             font-family: 'Outfit', sans-serif;
@@ -2026,14 +2125,21 @@ async function UsagePanel主页(TOKEN) {
             font-variant-numeric: tabular-nums;
         }
 
-        .quota-details { margin-top: 1.25rem; }
+        .quota-details { margin-top: 1.25rem; overflow: hidden; }
+        .quota-details[open] { display: flex; flex-direction: column; }
+        .quota-details.quota-animating .quota-summary { pointer-events: none; }
         .quota-summary { list-style: none; background: var(--item-bg); border: 1px solid var(--stroke); border-radius: 14px; padding: 0.85rem 1rem; cursor: pointer; display: flex; justify-content: space-between; gap: 1rem; align-items: center; color: var(--text-main); font-size: 0.85rem; font-weight: 600; transition: all 0.3s ease; }
         .quota-summary::-webkit-details-marker { display: none; }
         .quota-summary:hover { border-color: var(--primary); background: rgba(99, 102, 241, 0.08); }
         .quota-summary::after { content: '展开'; color: var(--text-muted); font-size: 0.75rem; font-weight: 500; }
         .quota-details[open] .quota-summary::after { content: '收起'; }
+        .quota-details[open] .quota-summary { order: 2; margin-top: 0.875rem; }
         .quota-summary-meta { color: var(--text-muted); font-size: 0.75rem; font-weight: 500; }
+        .quota-body { overflow: hidden; }
+        .quota-details[open] .quota-body { order: 1; }
+        .quota-details.quota-animating .quota-body { will-change: height, opacity, transform; }
         .quota-list { display: grid; gap: 0.875rem; margin-top: 0.875rem; }
+        .quota-details[open] .quota-list { margin-top: 0; }
         .quota-item { background: var(--item-bg); border: 1px solid var(--stroke); border-radius: 14px; padding: 0.875rem 1rem; }
         .quota-group-head { display: flex; justify-content: space-between; gap: 0.75rem; align-items: center; margin-bottom: 0.75rem; }
         .quota-group-title { color: var(--text-main); font-size: 0.9rem; font-weight: 700; }
@@ -2921,7 +3027,7 @@ async function UsagePanel主页(TOKEN) {
             const r2 = resources.r2 || {};
             return '<details class="quota-details">' +
                 '<summary class="quota-summary"><span>资源额度细节</span><span class="quota-summary-meta">KV / D1 / R2</span></summary>' +
-                '<div class="quota-list">' +
+                '<div class="quota-body"><div class="quota-list">' +
                     renderQuotaGroup('KV', formatNumber(kv.namespaces || 0) + ' 个命名空间', [
                         renderQuotaBar('读取（今日）', kv.reads, kv.readsLimit),
                         renderQuotaBar('写入（今日）', kv.writes, kv.writesLimit),
@@ -2938,8 +3044,82 @@ async function UsagePanel主页(TOKEN) {
                         renderQuotaBar('Class B（本月）', r2.classB, r2.classBLimit),
                         renderQuotaBar('存储', r2.storageBytes, r2.storageLimitBytes, formatBytes)
                     ]) +
-                '</div><div class="resource-note">D1/KV 按 UTC 自然日统计，R2 操作按本月统计；存储为最近一次指标快照。</div>' +
+                '</div><div class="resource-note">D1/KV 按 UTC 自然日统计，R2 操作按本月统计；存储为最近一次指标快照。</div></div>' +
             '</details>';
+        }
+
+        function prefersReducedMotion() {
+            return window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        }
+
+        function resetQuotaBody(body) {
+            body.style.height = '';
+            body.style.opacity = '';
+            body.style.transform = '';
+            body.style.overflow = '';
+        }
+
+        function animateQuotaDetails(details, opening) {
+            const body = details.querySelector('.quota-body');
+            if (!body || typeof body.animate !== 'function') {
+                details.open = opening;
+                return;
+            }
+
+            details.classList.add('quota-animating');
+            body.style.overflow = 'hidden';
+
+            if (opening) {
+                details.open = true;
+                body.style.height = '0px';
+                body.style.opacity = '0';
+                body.style.transform = 'translateY(6px)';
+            } else {
+                body.style.height = body.scrollHeight + 'px';
+                body.style.opacity = '1';
+                body.style.transform = 'translateY(0)';
+            }
+
+            const startHeight = opening ? 0 : body.scrollHeight;
+            const endHeight = opening ? body.scrollHeight : 0;
+            const animation = body.animate([
+                { height: startHeight + 'px', opacity: opening ? 0 : 1, transform: opening ? 'translateY(6px)' : 'translateY(0)' },
+                { height: endHeight + 'px', opacity: opening ? 1 : 0, transform: opening ? 'translateY(0)' : 'translateY(6px)' }
+            ], {
+                duration: 260,
+                easing: 'cubic-bezier(0.4, 0, 0.2, 1)',
+                fill: 'forwards'
+            });
+
+            animation.onfinish = () => {
+                animation.cancel();
+                if (!opening) details.open = false;
+                resetQuotaBody(body);
+                details.classList.remove('quota-animating');
+            };
+
+            animation.oncancel = () => {
+                resetQuotaBody(body);
+                details.classList.remove('quota-animating');
+            };
+        }
+
+        function bindQuotaDetailsAnimations(scope) {
+            if (!scope) return;
+            scope.querySelectorAll('.quota-details').forEach(details => {
+                if (details.dataset.quotaAnimationBound) return;
+                const summary = details.querySelector('.quota-summary');
+                const body = details.querySelector('.quota-body');
+                if (!summary || !body) return;
+
+                details.dataset.quotaAnimationBound = 'true';
+                summary.addEventListener('click', (event) => {
+                    if (prefersReducedMotion() || typeof body.animate !== 'function') return;
+                    event.preventDefault();
+                    if (details.classList.contains('quota-animating')) return;
+                    animateQuotaDetails(details, !details.open);
+                });
+            });
         }
 
         async function fetchUsage() {
@@ -2994,6 +3174,7 @@ async function UsagePanel主页(TOKEN) {
                     </div>
                     \${renderResourceQuotas(resources)}
                 \`;
+                bindQuotaDetailsAnimations(content);
 
                 // Animate progress bar and apply colors
                 requestAnimationFrame(() => {
