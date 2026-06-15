@@ -27,14 +27,16 @@ export default {
             };
 
             if (访问路径 == 'usage.json') {// 请求数使用数据接口 Usage.json
-                let usage_json = { ...usage_json_default };
+                let usage_json = 创建默认Usage(false);
                 if (url.searchParams.get('token') === 临时TOKEN || url.searchParams.get('token') === 管理员TOKEN) {
                     const 当前时间 = Date.now();
-                    usage_json = await env.KV.get('usage.json', { type: 'json' }) || usage_json;
+                    const 已保存Usage = await env.KV.get('usage.json', { type: 'json' });
+                    const 已保存更新时间 = Number(已保存Usage?.UpdateTime || 0) || 0;
+                    usage_json = 补全Usage结构(已保存Usage || {});
                     usage_json.success = true;
                     usage_json.total = (usage_json.pages || 0) + (usage_json.workers || 0);
-                    usage_json.msg = '✅ 成功加载请求数使用数据';
-                    if (!usage_json.UpdateTime || (当前时间 - usage_json.UpdateTime) > 20 * 60 * 1000) usage_json = await 更新请求数(env);
+                    usage_json.msg = '✅ 成功加载免费额度使用数据';
+                    if (!已保存更新时间 || (当前时间 - 已保存更新时间) > 获取单账号查询间隔毫秒(env)) usage_json = await 更新请求数(env);
                 }
                 return new Response(JSON.stringify(usage_json, null, 2), { headers: { 'Content-Type': 'application/json;charset=UTF-8', 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' } });
             } else if (访问路径 == 'admin' || 访问路径.startsWith('admin/')) {// 管理员面板
@@ -42,22 +44,30 @@ export default {
                 if (验证管理员Cookie()) {
                     if (区分大小写访问路径 === 'admin/config.json') {
                         const usage_config_json = await env.KV.get('usage_config.json', { type: 'json' }) || [];
-                        const masked_config_json = usage_config_json.map(item => ({
-                            ...item,
-                            GlobalAPIKey: item.GlobalAPIKey ? 掩码敏感信息(item.GlobalAPIKey) : null,
-                            APIToken: item.APIToken ? 掩码敏感信息(item.APIToken) : null
-                        }));
+                        const masked_config_json = usage_config_json.map(item => {
+                            const updateTime = 获取账号最后更新时间(item);
+                            return {
+                                ...item,
+                                UpdateTime: updateTime || item.UpdateTime,
+                                Usage: 补全账号Usage结构(item),
+                                GlobalAPIKey: item.GlobalAPIKey ? 掩码敏感信息(item.GlobalAPIKey) : null,
+                                APIToken: item.APIToken ? 掩码敏感信息(item.APIToken) : null
+                            };
+                        });
                         return new Response(JSON.stringify(masked_config_json, null, 2), { status: 200, headers: { 'Content-Type': 'application/json;charset=UTF-8' } });
                     } else if (区分大小写访问路径 === 'admin/usage.json') {
-                        const usage_json = await 更新请求数(env);
+                        const usage_json = await 更新请求数(env, { force: url.searchParams.get('force') === '1' });
                         return new Response(JSON.stringify(usage_json, null, 2), { headers: { 'Content-Type': 'application/json;charset=UTF-8' } });
                     }
 
                     return UsagePanel管理面板(管理员TOKEN);
-                }
+                } else return new Response(null, { status: 302, headers: { 'Location': '/' } });
 
-            } else if (区分大小写访问路径.startsWith('api/') && request.method === 'POST') {// API接口
+            } else if (区分大小写访问路径.startsWith('api/')) {// API接口
                 if (区分大小写访问路径 === 'api/login') { // 管理员登录接口
+                    if (request.method !== 'POST') {
+                        return new Response(JSON.stringify({ success: false, msg: 'Method Not Allowed' }), { status: 405, headers: { 'Content-Type': 'application/json;charset=UTF-8' } });
+                    }
                     try {
                         const body = await request.json();
                         const 输入账号 = body.username || '';
@@ -85,12 +95,10 @@ export default {
                     }
                 }
 
-                if (!验证管理员Cookie()) {
-                    return new Response(null, {
-                        status: 302,
-                        headers: { 'Location': '/' }
-                    });
+                if (request.method !== 'POST') {
+                    return new Response(JSON.stringify({ success: false, msg: 'Method Not Allowed' }), { status: 405, headers: { 'Content-Type': 'application/json;charset=UTF-8' } });
                 }
+                if (!验证管理员Cookie()) return new Response(null, { status: 302, headers: { 'Location': '/' } });
 
                 if (区分大小写访问路径 === 'api/logout') {// 登出接口
                     return new Response(JSON.stringify({ success: true, msg: '登出成功' }), {
@@ -112,6 +120,7 @@ export default {
                             return new Response(JSON.stringify({ success: false, msg: '配置不完整，需要提供 Email+GlobalAPIKey 或 AccountID+APIToken' }), { status: 400, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
                         }
 
+                        const now = Date.now();
                         const CF_JSON = {
                             ID: 0,
                             Name: newConfig.Name || '未命名账号',
@@ -119,14 +128,9 @@ export default {
                             GlobalAPIKey: hasEmailAuth ? newConfig.GlobalAPIKey : null,
                             AccountID: newConfig.AccountID || null,
                             APIToken: hasTokenAuth ? newConfig.APIToken : null,
-                            UpdateTime: Date.now(),
-                            Usage: {
-                                success: false,
-                                pages: 0,
-                                workers: 0,
-                                total: 0,
-                                max: 100000
-                            }
+                            UpdateTime: now,
+                            LastCheckTime: now,
+                            Usage: 创建默认Usage(false)
                         };
 
                         // 验证 API 信息是否有效
@@ -135,8 +139,9 @@ export default {
                             return new Response(JSON.stringify({ success: false, msg: '无法验证该CF账号的API信息' }), { status: 400, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
                         }
 
-                        CF_JSON.Usage = usage_result;
                         CF_JSON.UpdateTime = Date.now();
+                        CF_JSON.LastCheckTime = CF_JSON.UpdateTime;
+                        CF_JSON.Usage = 补全账号Usage结构({ ...CF_JSON, Usage: usage_result });
 
                         // 读取现有配置
                         let usage_config_json = await env.KV.get('usage_config.json', { type: 'json' });
@@ -236,62 +241,324 @@ export default {
     },
     async scheduled(event, env, ctx) {
         // 定时执行请求数更新
-        ctx.waitUntil(更新请求数(env));
+        ctx.waitUntil((async () => {
+            await 更新请求数(env);
+        })());
     }
 };
 
 ////////////////////////////////功能函数//////////////////////////////////
-const usage_json_default = {
-    success: false, // 是否成功获取使用情况
-    pages: 0, // cf的已使用的pages请求数
-    workers: 0, // cf的已使用的workers请求数
-    total: 0, // cf的已使用的总请求数
-    max: 0, // cf的请求数上限
-    UpdateTime: Date.now(), // 数据最后更新时间的时间戳
-    msg: '❌ 无效TOKEN' // 备注信息
+const 免费额度 = {
+    requestsDaily: 100000,
+    d1RowsReadDaily: 5000000,
+    d1RowsWrittenDaily: 100000,
+    d1StorageBytes: 5 * 1024 * 1024 * 1024,
+    kvReadsDaily: 100000,
+    kvWritesDaily: 1000,
+    kvDeletesDaily: 1000,
+    kvListsDaily: 1000,
+    kvStorageBytes: 1 * 1024 * 1024 * 1024,
+    r2ClassAMonthly: 1000000,
+    r2ClassBMonthly: 10000000,
+    r2StorageBytes: 10 * 1024 * 1024 * 1024
+};
+
+const 默认单账号查询间隔毫秒 = 20 * 60 * 1000;
+const 默认每轮最多外部子请求数 = 50;
+
+const R2_CLASS_A_ACTIONS = new Set([
+    'listbuckets', 'putbucket', 'listobjects', 'listobjectsv2', 'putobject', 'copyobject',
+    'completemultipartupload', 'createmultipartupload', 'lifecyclestoragetiertransition',
+    'listmultipartuploads', 'uploadpart', 'uploadpartcopy', 'listparts',
+    'putbucketencryption', 'putbucketcors', 'putbucketlifecycleconfiguration'
+]);
+
+const R2_CLASS_B_ACTIONS = new Set([
+    'headbucket', 'headobject', 'getobject', 'usagesummary', 'getbucketencryption',
+    'getbucketlocation', 'getbucketcors', 'getbucketlifecycleconfiguration'
+]);
+
+const R2_FREE_ACTIONS = new Set(['deleteobject', 'deleteobjects', 'deletebucket', 'abortmultipartupload']);
+
+function 创建默认资源统计() {
+    return {
+        d1: {
+            rowsRead: 0,
+            rowsReadLimit: 免费额度.d1RowsReadDaily,
+            rowsWritten: 0,
+            rowsWrittenLimit: 免费额度.d1RowsWrittenDaily,
+            readQueries: 0,
+            writeQueries: 0,
+            storageBytes: 0,
+            storageLimitBytes: 免费额度.d1StorageBytes,
+            databases: 0,
+            period: 'day'
+        },
+        kv: {
+            reads: 0,
+            readsLimit: 免费额度.kvReadsDaily,
+            writes: 0,
+            writesLimit: 免费额度.kvWritesDaily,
+            deletes: 0,
+            deletesLimit: 免费额度.kvDeletesDaily,
+            lists: 0,
+            listsLimit: 免费额度.kvListsDaily,
+            operations: 0,
+            storageBytes: 0,
+            storageLimitBytes: 免费额度.kvStorageBytes,
+            keys: 0,
+            namespaces: 0,
+            period: 'day'
+        },
+        r2: {
+            classA: 0,
+            classALimit: 免费额度.r2ClassAMonthly,
+            classB: 0,
+            classBLimit: 免费额度.r2ClassBMonthly,
+            free: 0,
+            other: 0,
+            operations: 0,
+            storageBytes: 0,
+            storageLimitBytes: 免费额度.r2StorageBytes,
+            objects: 0,
+            buckets: 0,
+            period: 'month'
+        }
+    };
 }
 
-async function 更新请求数(env) {
+function 创建汇总资源统计() {
+    const resources = 创建默认资源统计();
+    resources.d1.rowsReadLimit = 0;
+    resources.d1.rowsWrittenLimit = 0;
+    resources.d1.storageLimitBytes = 0;
+    resources.kv.readsLimit = 0;
+    resources.kv.writesLimit = 0;
+    resources.kv.deletesLimit = 0;
+    resources.kv.listsLimit = 0;
+    resources.kv.storageLimitBytes = 0;
+    resources.r2.classALimit = 0;
+    resources.r2.classBLimit = 0;
+    resources.r2.storageLimitBytes = 0;
+    return resources;
+}
+
+function 创建默认Usage(success = false, msg = '❌ 无效TOKEN') {
+    return {
+        success,
+        pages: 0,
+        workers: 0,
+        total: 0,
+        max: success ? 免费额度.requestsDaily : 0,
+        resources: 创建默认资源统计(),
+        UpdateTime: Date.now(),
+        msg
+    };
+}
+
+function 合并资源统计(base, extra = {}) {
+    const merged = { ...base };
+    for (const key of Object.keys(base)) {
+        merged[key] = { ...base[key], ...(extra?.[key] || {}) };
+    }
+    return merged;
+}
+
+function 补全Usage结构(usage) {
+    const source = usage || {};
+    const base = 创建默认Usage(false);
+    const normalized = { ...base, ...source };
+    const updateTime = Number(source.UpdateTime || 0) || 0;
+    const hasResourceData = !!source.resources;
+    normalized.pages = Number(normalized.pages) || 0;
+    normalized.workers = Number(normalized.workers) || 0;
+    normalized.total = Number(normalized.total) || normalized.pages + normalized.workers;
+    normalized.max = Number(normalized.max) || 免费额度.requestsDaily;
+    normalized.UpdateTime = updateTime;
+    normalized.resources = 合并资源统计(hasResourceData ? 创建默认资源统计() : 创建汇总资源统计(), normalized.resources || {});
+    return normalized;
+}
+
+function 累加资源统计(target, source) {
+    const data = 合并资源统计(创建默认资源统计(), source || {});
+
+    target.d1.rowsRead += data.d1.rowsRead || 0;
+    target.d1.rowsReadLimit += data.d1.rowsReadLimit || 免费额度.d1RowsReadDaily;
+    target.d1.rowsWritten += data.d1.rowsWritten || 0;
+    target.d1.rowsWrittenLimit += data.d1.rowsWrittenLimit || 免费额度.d1RowsWrittenDaily;
+    target.d1.readQueries += data.d1.readQueries || 0;
+    target.d1.writeQueries += data.d1.writeQueries || 0;
+    target.d1.storageBytes += data.d1.storageBytes || 0;
+    target.d1.storageLimitBytes += data.d1.storageLimitBytes || 免费额度.d1StorageBytes;
+    target.d1.databases += data.d1.databases || 0;
+
+    target.kv.reads += data.kv.reads || 0;
+    target.kv.readsLimit += data.kv.readsLimit || 免费额度.kvReadsDaily;
+    target.kv.writes += data.kv.writes || 0;
+    target.kv.writesLimit += data.kv.writesLimit || 免费额度.kvWritesDaily;
+    target.kv.deletes += data.kv.deletes || 0;
+    target.kv.deletesLimit += data.kv.deletesLimit || 免费额度.kvDeletesDaily;
+    target.kv.lists += data.kv.lists || 0;
+    target.kv.listsLimit += data.kv.listsLimit || 免费额度.kvListsDaily;
+    target.kv.operations += data.kv.operations || 0;
+    target.kv.storageBytes += data.kv.storageBytes || 0;
+    target.kv.storageLimitBytes += data.kv.storageLimitBytes || 免费额度.kvStorageBytes;
+    target.kv.keys += data.kv.keys || 0;
+    target.kv.namespaces += data.kv.namespaces || 0;
+
+    target.r2.classA += data.r2.classA || 0;
+    target.r2.classALimit += data.r2.classALimit || 免费额度.r2ClassAMonthly;
+    target.r2.classB += data.r2.classB || 0;
+    target.r2.classBLimit += data.r2.classBLimit || 免费额度.r2ClassBMonthly;
+    target.r2.free += data.r2.free || 0;
+    target.r2.other += data.r2.other || 0;
+    target.r2.operations += data.r2.operations || 0;
+    target.r2.storageBytes += data.r2.storageBytes || 0;
+    target.r2.storageLimitBytes += data.r2.storageLimitBytes || 免费额度.r2StorageBytes;
+    target.r2.objects += data.r2.objects || 0;
+    target.r2.buckets += data.r2.buckets || 0;
+}
+
+function 获取统计时间窗口() {
+    const now = new Date();
+    const dayStart = new Date(now);
+    dayStart.setUTCHours(0, 0, 0, 0);
+    const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+
+    return {
+        nowIso: now.toISOString(),
+        dayStartIso: dayStart.toISOString(),
+        monthStartIso: monthStart.toISOString(),
+        dayStartDate: dayStart.toISOString().slice(0, 10),
+        monthStartDate: monthStart.toISOString().slice(0, 10),
+        dateEnd: now.toISOString().slice(0, 10)
+    };
+}
+
+function 获取单账号查询间隔毫秒(env = {}) {
+    const ms = Number(env.ACCOUNT_CHECK_INTERVAL_MS || env.account_check_interval_ms);
+    if (Number.isFinite(ms) && ms > 0) return ms;
+
+    const minutes = Number(env.ACCOUNT_CHECK_INTERVAL_MINUTES || env.account_check_interval_minutes || env.CHECK_INTERVAL_MINUTES || env.check_interval_minutes);
+    if (Number.isFinite(minutes) && minutes > 0) return minutes * 60 * 1000;
+
+    return 默认单账号查询间隔毫秒;
+}
+
+function 获取每轮最多外部子请求数(env = {}) {
+    const configured = Number(env.MAX_EXTERNAL_SUBREQUESTS_PER_RUN || env.max_external_subrequests_per_run);
+    if (Number.isFinite(configured) && configured > 0) return Math.min(Math.max(1, Math.floor(configured)), 默认每轮最多外部子请求数);
+    return 默认每轮最多外部子请求数;
+}
+
+function 估算账号查询外部子请求数(account = {}) {
+    if (account.AccountID) return 4;
+    if (account.Email && account.GlobalAPIKey) return 5;
+    return 5;
+}
+
+function 获取账号最后更新时间(account) {
+    return Number(account?.UpdateTime || account?.Usage?.UpdateTime || 0) || 0;
+}
+
+function 补全账号Usage结构(account) {
+    const usage = 补全Usage结构(account?.Usage || {});
+    delete usage.UpdateTime;
+    return usage;
+}
+
+function 写入账号查询结果(account, usage, queryTime = Date.now()) {
+    const normalized = 补全Usage结构(usage || {});
+    normalized.UpdateTime = queryTime;
+    account.Usage = 补全账号Usage结构({ ...account, Usage: normalized });
+    account.UpdateTime = queryTime;
+    account.LastCheckTime = queryTime;
+    delete account.LastCheckError;
+    delete account.LastCheckErrorTime;
+    return normalized;
+}
+
+function 写入账号查询失败(account, error, queryTime = Date.now()) {
+    const lastUpdateTime = 获取账号最后更新时间(account);
+    if (lastUpdateTime && !account.UpdateTime) account.UpdateTime = lastUpdateTime;
+    account.LastCheckTime = queryTime;
+    account.LastCheckErrorTime = queryTime;
+    account.LastCheckError = typeof error === 'string' ? error : (error?.msg || error?.message || '查询失败');
+    account.Usage = 补全账号Usage结构(account);
+    return account.Usage;
+}
+
+async function 更新请求数(env, options = {}) {
     let usage_config_json = await env.KV.get('usage_config.json', { type: 'json' });
-    let usage_json = { ...usage_json_default };
+    let usage_json = 创建默认Usage(false);
 
     if (!usage_config_json) {
         // 不存在则创建一个空的配置文件
         usage_config_json = [];
         await env.KV.put('usage_config.json', JSON.stringify(usage_config_json));
         usage_json.success = true;
+        usage_json.resources = 创建汇总资源统计();
         usage_json.msg = '⚠️ 尚未添加任何Cloudflare账号';
         await env.KV.put('usage.json', JSON.stringify(usage_json));
     } else if (Array.isArray(usage_config_json) && usage_config_json.length > 0) {
-        // 如果存在则遍历配置文件中的每个账号，获取使用情况
-        // 累加所有账号的使用数据
+        const thresholdMs = Number(options.thresholdMs) || 获取单账号查询间隔毫秒(env);
+        const externalSubrequestLimit = 获取每轮最多外部子请求数(env);
+        const now = Date.now();
+
+        const accountStates = usage_config_json.map((account, index) => {
+            const lastUpdateTime = 获取账号最后更新时间(account);
+            account.Usage = 补全账号Usage结构(account);
+            if (lastUpdateTime && !account.UpdateTime) account.UpdateTime = lastUpdateTime;
+            if (lastUpdateTime && !account.LastCheckTime) account.LastCheckTime = lastUpdateTime;
+            return { account, index, lastUpdateTime };
+        });
+
+        const expiredAccounts = accountStates
+            .filter(item => options.force || !item.lastUpdateTime || now - item.lastUpdateTime > thresholdMs)
+            .sort((a, b) => (a.lastUpdateTime || 0) - (b.lastUpdateTime || 0));
+        const accountsToRefresh = [];
+        let estimatedExternalSubrequests = 0;
+        for (const item of expiredAccounts) {
+            const accountSubrequests = 估算账号查询外部子请求数(item.account);
+            if (estimatedExternalSubrequests + accountSubrequests > externalSubrequestLimit) continue;
+            accountsToRefresh.push({ ...item, estimatedExternalSubrequests: accountSubrequests });
+            estimatedExternalSubrequests += accountSubrequests;
+        }
+
+        let refreshedCount = 0;
+        let failedRefreshCount = 0;
+
+        await Promise.all(accountsToRefresh.map(async ({ account }) => {
+            try {
+                const usage = await getCloudflareUsage(account.Email, account.GlobalAPIKey, account.AccountID, account.APIToken);
+                if (!usage.success) {
+                    写入账号查询失败(account, usage, Date.now());
+                    failedRefreshCount += 1;
+                    return;
+                }
+                写入账号查询结果(account, usage, Date.now());
+                refreshedCount += 1;
+            } catch (error) {
+                failedRefreshCount += 1;
+                console.error(`账号 ${account.ID} 查询失败:`, error.message);
+                写入账号查询失败(account, error, Date.now());
+            }
+        }));
+
+        // 累加所有账号的使用数据，未达到刷新阈值或超过本轮上限的账号使用历史数据。
         let total_pages = 0;
         let total_workers = 0;
         let total_max = 0;
+        const total_resources = 创建汇总资源统计();
 
-        // 使用 Promise.all 并发获取所有账号的使用情况
-        const updatePromises = usage_config_json.map(async (account) => {
-            const { Email, GlobalAPIKey, AccountID, APIToken } = account;
-
-            // 获取该账号的使用情况
-            const usage = await getCloudflareUsage(Email, GlobalAPIKey, AccountID, APIToken);
-
-            // 更新到该账号的 Usage 中
+        for (const account of usage_config_json) {
+            const usage = 补全账号Usage结构(account);
             account.Usage = usage;
-            account.UpdateTime = Date.now();
-
-            return usage;
-        });
-
-        // 等待所有请求完成
-        const results = await Promise.all(updatePromises);
-
-        // 累加使用数据
-        for (const usage of results) {
             if (usage.success) {
                 total_pages += usage.pages || 0;
                 total_workers += usage.workers || 0;
-                total_max += usage.max || 100000;
+                total_max += usage.max || 免费额度.requestsDaily;
+                累加资源统计(total_resources, usage.resources);
             }
         }
 
@@ -304,12 +571,27 @@ async function 更新请求数(env) {
         usage_json.workers = total_workers;
         usage_json.total = total_pages + total_workers;
         usage_json.max = total_max;
+        usage_json.resources = total_resources;
         usage_json.UpdateTime = Date.now();
-        usage_json.msg = '✅ 成功更新请求数使用数据';
+        usage_json.RefreshStats = {
+            refreshed: refreshedCount,
+            failed: failedRefreshCount,
+            cached: Math.max(usage_config_json.length - refreshedCount, 0),
+            skippedByLimit: Math.max(expiredAccounts.length - accountsToRefresh.length, 0),
+            maxRefresh: accountsToRefresh.length,
+            externalSubrequestsEstimated: estimatedExternalSubrequests,
+            externalSubrequestLimit,
+            perAccountExternalSubrequests: { withAccountId: 4, withoutAccountId: 5 },
+            thresholdMs
+        };
+        usage_json.msg = failedRefreshCount > 0
+            ? `⚠️ 部分账号查询失败（本次刷新 ${refreshedCount} 个账号，失败 ${failedRefreshCount} 个，${usage_json.RefreshStats.cached} 个使用历史数据）`
+            : `✅ 成功更新免费额度使用数据（本次刷新 ${refreshedCount} 个账号，${usage_json.RefreshStats.cached} 个使用历史数据）`;
         await env.KV.put('usage.json', JSON.stringify(usage_json));
     } else {
         // 配置文件存在但为空数组或无效格式
         usage_json.success = true;
+        usage_json.resources = 创建汇总资源统计();
         usage_json.UpdateTime = Date.now();
         usage_json.msg = '⚠️ 尚未添加任何Cloudflare账号';
         await env.KV.put('usage.json', JSON.stringify(usage_json));
@@ -332,61 +614,233 @@ async function MD5MD5(文本) {
     return 第二次十六进制.toLowerCase();
 }
 
+function 数字(value) {
+    return Number(value) || 0;
+}
+
+function 合计请求数(groups) {
+    return groups?.reduce((total, item) => total + 数字(item?.sum?.requests), 0) || 0;
+}
+
+function 规范化动作名称(action) {
+    return String(action || '').replace(/[^a-z0-9]/gi, '').toLowerCase();
+}
+
+function 选择最新分组(groups, idField, timeField) {
+    const latest = new Map();
+    for (const group of groups || []) {
+        const dimensions = group?.dimensions || {};
+        const id = dimensions[idField] || '__account';
+        const time = String(dimensions[timeField] || '');
+        const current = latest.get(id);
+        if (!current || time >= current.time) latest.set(id, { time, group });
+    }
+    return Array.from(latest.values()).map(item => item.group);
+}
+
+async function 发送GraphQL请求(API, headers, query, variables) {
+    const res = await fetch(`${API}/graphql`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ query, variables })
+    });
+
+    if (!res.ok) throw new Error(`查询失败: ${res.status}`);
+    const result = await res.json();
+    if (result.errors?.length) throw new Error(result.errors.map(error => error.message).join('; '));
+
+    const account = result?.data?.viewer?.accounts?.[0];
+    if (!account) throw new Error("未找到账户数据");
+    return account;
+}
+
+async function 获取Cloudflare账户ID(API, headers, Email) {
+    const r = await fetch(`${API}/accounts`, { method: "GET", headers });
+    if (!r.ok) throw new Error(`账户获取失败: ${r.status}`);
+    const d = await r.json();
+    if (!d?.result?.length) throw new Error("未找到账户");
+    const idx = d.result.findIndex(account => account.name?.toLowerCase().startsWith(Email.toLowerCase()));
+    return d.result[idx >= 0 ? idx : 0]?.id;
+}
+
+async function 查询WorkersPages统计(API, headers, AccountID, 时间窗口) {
+    const account = await 发送GraphQL请求(API, headers, `query getBillingMetrics($AccountID: String!, $filter: AccountWorkersInvocationsAdaptiveFilter_InputObject) {
+        viewer { accounts(filter: {accountTag: $AccountID}) {
+            pagesFunctionsInvocationsAdaptiveGroups(limit: 1000, filter: $filter) { sum { requests } }
+            workersInvocationsAdaptive(limit: 10000, filter: $filter) { sum { requests } }
+        } }
+    }`, {
+        AccountID,
+        filter: { datetime_geq: 时间窗口.dayStartIso, datetime_leq: 时间窗口.nowIso }
+    });
+
+    return {
+        pages: 合计请求数(account.pagesFunctionsInvocationsAdaptiveGroups),
+        workers: 合计请求数(account.workersInvocationsAdaptive)
+    };
+}
+
+async function 查询D1统计(API, headers, AccountID, 时间窗口) {
+    const d1 = 创建默认资源统计().d1;
+    const account = await 发送GraphQL请求(API, headers, `query D1Usage($accountTag: String!, $dayStart: Date!, $dateEnd: Date!, $storageStart: Date!) {
+        viewer { accounts(filter: {accountTag: $accountTag}) {
+            d1AnalyticsAdaptiveGroups(limit: 10000, filter: {date_geq: $dayStart, date_leq: $dateEnd}) {
+                sum { rowsRead rowsWritten readQueries writeQueries }
+                dimensions { date databaseId }
+            }
+            d1StorageAdaptiveGroups(limit: 10000, filter: {date_geq: $storageStart, date_leq: $dateEnd}, orderBy: [date_DESC]) {
+                max { databaseSizeBytes }
+                dimensions { date databaseId }
+            }
+        } }
+    }`, {
+        accountTag: AccountID,
+        dayStart: 时间窗口.dayStartDate,
+        dateEnd: 时间窗口.dateEnd,
+        storageStart: 时间窗口.monthStartDate
+    });
+
+    for (const group of account.d1AnalyticsAdaptiveGroups || []) {
+        d1.rowsRead += 数字(group?.sum?.rowsRead);
+        d1.rowsWritten += 数字(group?.sum?.rowsWritten);
+        d1.readQueries += 数字(group?.sum?.readQueries);
+        d1.writeQueries += 数字(group?.sum?.writeQueries);
+    }
+
+    const storageGroups = 选择最新分组(account.d1StorageAdaptiveGroups, 'databaseId', 'date');
+    d1.databases = storageGroups.length;
+    d1.storageBytes = storageGroups.reduce((total, group) => total + 数字(group?.max?.databaseSizeBytes), 0);
+    return d1;
+}
+
+async function 查询KV统计(API, headers, AccountID, 时间窗口) {
+    const kv = 创建默认资源统计().kv;
+    const account = await 发送GraphQL请求(API, headers, `query KvUsage($accountTag: String!, $dayStart: Date!, $dateEnd: Date!, $storageStart: Date!) {
+        viewer { accounts(filter: {accountTag: $accountTag}) {
+            kvOperationsAdaptiveGroups(limit: 10000, filter: {date_geq: $dayStart, date_leq: $dateEnd}) {
+                sum { requests }
+                dimensions { actionType }
+            }
+            kvStorageAdaptiveGroups(limit: 10000, filter: {date_geq: $storageStart, date_leq: $dateEnd}, orderBy: [date_DESC]) {
+                max { keyCount byteCount }
+                dimensions { date namespaceId }
+            }
+        } }
+    }`, {
+        accountTag: AccountID,
+        dayStart: 时间窗口.dayStartDate,
+        dateEnd: 时间窗口.dateEnd,
+        storageStart: 时间窗口.monthStartDate
+    });
+
+    for (const group of account.kvOperationsAdaptiveGroups || []) {
+        const requests = 数字(group?.sum?.requests);
+        const actionType = String(group?.dimensions?.actionType || '').toLowerCase();
+        kv.operations += requests;
+
+        if (actionType.includes('read')) kv.reads += requests;
+        else if (actionType.includes('write')) kv.writes += requests;
+        else if (actionType.includes('delete')) kv.deletes += requests;
+        else if (actionType.includes('list')) kv.lists += requests;
+    }
+
+    const storageGroups = 选择最新分组(account.kvStorageAdaptiveGroups, 'namespaceId', 'date');
+    kv.namespaces = storageGroups.length;
+    kv.keys = storageGroups.reduce((total, group) => total + 数字(group?.max?.keyCount), 0);
+    kv.storageBytes = storageGroups.reduce((total, group) => total + 数字(group?.max?.byteCount), 0);
+    return kv;
+}
+
+async function 查询R2统计(API, headers, AccountID, 时间窗口) {
+    const r2 = 创建默认资源统计().r2;
+    const account = await 发送GraphQL请求(API, headers, `query R2Usage($accountTag: String!, $monthStart: Time!, $now: Time!) {
+        viewer { accounts(filter: {accountTag: $accountTag}) {
+            r2OperationsAdaptiveGroups(limit: 10000, filter: {datetime_geq: $monthStart, datetime_leq: $now}) {
+                sum { requests }
+                dimensions { actionType actionStatus }
+            }
+            r2StorageAdaptiveGroups(limit: 10000, filter: {datetime_geq: $monthStart, datetime_leq: $now}, orderBy: [datetime_DESC]) {
+                max { objectCount uploadCount payloadSize metadataSize }
+                dimensions { datetime bucketName }
+            }
+        } }
+    }`, {
+        accountTag: AccountID,
+        monthStart: 时间窗口.monthStartIso,
+        now: 时间窗口.nowIso
+    });
+
+    for (const group of account.r2OperationsAdaptiveGroups || []) {
+        const status = String(group?.dimensions?.actionStatus || 'success').toLowerCase();
+        if (status && status !== 'success') continue;
+
+        const requests = 数字(group?.sum?.requests);
+        const action = 规范化动作名称(group?.dimensions?.actionType);
+        r2.operations += requests;
+
+        if (R2_CLASS_A_ACTIONS.has(action)) r2.classA += requests;
+        else if (R2_CLASS_B_ACTIONS.has(action)) r2.classB += requests;
+        else if (R2_FREE_ACTIONS.has(action)) r2.free += requests;
+        else r2.other += requests;
+    }
+
+    const storageGroups = 选择最新分组(account.r2StorageAdaptiveGroups, 'bucketName', 'datetime');
+    r2.buckets = storageGroups.length;
+    r2.objects = storageGroups.reduce((total, group) => total + 数字(group?.max?.objectCount), 0);
+    r2.storageBytes = storageGroups.reduce((total, group) => total + 数字(group?.max?.payloadSize) + 数字(group?.max?.metadataSize), 0);
+    return r2;
+}
+
 async function getCloudflareUsage(Email, GlobalAPIKey, AccountID, APIToken) {
     const API = "https://api.cloudflare.com/client/v4";
-    const sum = (a) => a?.reduce((t, i) => t + (i?.sum?.requests || 0), 0) || 0;
     const cfg = { "Content-Type": "application/json" };
+    const fallback = 创建默认Usage(false);
+    fallback.max = 免费额度.requestsDaily;
 
     try {
-        if (!AccountID && (!Email || !GlobalAPIKey)) return { success: false, pages: 0, workers: 0, total: 0, max: 100000 };
+        if (!AccountID && (!Email || !GlobalAPIKey)) return fallback;
 
-        if (!AccountID) {
-            const r = await fetch(`${API}/accounts`, {
-                method: "GET",
-                headers: { ...cfg, "X-AUTH-EMAIL": Email, "X-AUTH-KEY": GlobalAPIKey }
-            });
-            if (!r.ok) throw new Error(`账户获取失败: ${r.status}`);
-            const d = await r.json();
-            if (!d?.result?.length) throw new Error("未找到账户");
-            const idx = d.result.findIndex(a => a.name?.toLowerCase().startsWith(Email.toLowerCase()));
-            AccountID = d.result[idx >= 0 ? idx : 0]?.id;
-        }
-
-        const now = new Date();
-        now.setUTCHours(0, 0, 0, 0);
         const hdr = APIToken ? { ...cfg, "Authorization": `Bearer ${APIToken}` } : { ...cfg, "X-AUTH-EMAIL": Email, "X-AUTH-KEY": GlobalAPIKey };
+        if (!AccountID) AccountID = await 获取Cloudflare账户ID(API, hdr, Email);
 
-        const res = await fetch(`${API}/graphql`, {
-            method: "POST",
-            headers: hdr,
-            body: JSON.stringify({
-                query: `query getBillingMetrics($AccountID: String!, $filter: AccountWorkersInvocationsAdaptiveFilter_InputObject) {
-                    viewer { accounts(filter: {accountTag: $AccountID}) {
-                        pagesFunctionsInvocationsAdaptiveGroups(limit: 1000, filter: $filter) { sum { requests } }
-                        workersInvocationsAdaptive(limit: 10000, filter: $filter) { sum { requests } }
-                    } }
-                }`,
-                variables: { AccountID, filter: { datetime_geq: now.toISOString(), datetime_leq: new Date().toISOString() } }
-            })
-        });
+        const 时间窗口 = 获取统计时间窗口();
+        const usage = 创建默认Usage(true, '✅ 成功更新免费额度使用数据');
+        const core = await 查询WorkersPages统计(API, hdr, AccountID, 时间窗口);
 
-        if (!res.ok) throw new Error(`查询失败: ${res.status}`);
-        const result = await res.json();
-        if (result.errors?.length) throw new Error(result.errors[0].message);
+        usage.pages = core.pages;
+        usage.workers = core.workers;
+        usage.total = core.pages + core.workers;
+        usage.max = 免费额度.requestsDaily;
 
-        const acc = result?.data?.viewer?.accounts?.[0];
-        if (!acc) throw new Error("未找到账户数据");
+        const errors = [];
+        const safeQuery = async (label, query, defaultValue) => {
+            try {
+                return await query();
+            } catch (error) {
+                console.warn(`${label} 统计失败:`, error.message);
+                errors.push(`${label}: ${error.message}`);
+                return defaultValue;
+            }
+        };
 
-        const pages = sum(acc.pagesFunctionsInvocationsAdaptiveGroups);
-        const workers = sum(acc.workersInvocationsAdaptive);
-        const total = pages + workers;
-        const max = 100000;
-        console.log(`统计结果 - Pages: ${pages}, Workers: ${workers}, 总计: ${total}, 上限: 100000`);
-        return { success: true, pages, workers, total, max };
+        const [d1, kv, r2] = await Promise.all([
+            safeQuery('D1', () => 查询D1统计(API, hdr, AccountID, 时间窗口), 创建默认资源统计().d1),
+            safeQuery('KV', () => 查询KV统计(API, hdr, AccountID, 时间窗口), 创建默认资源统计().kv),
+            safeQuery('R2', () => 查询R2统计(API, hdr, AccountID, 时间窗口), 创建默认资源统计().r2)
+        ]);
+
+        usage.resources.d1 = d1;
+        usage.resources.kv = kv;
+        usage.resources.r2 = r2;
+        if (errors.length) usage.errors = errors;
+
+        console.log(`统计结果 - Pages: ${usage.pages}, Workers: ${usage.workers}, D1读: ${d1.rowsRead}, KV读: ${kv.reads}, R2 A/B: ${r2.classA}/${r2.classB}`);
+        return usage;
 
     } catch (error) {
         console.error('获取使用量错误:', error.message);
-        return { success: false, pages: 0, workers: 0, total: 0, max: 100000 };
+        fallback.msg = '❌ 获取使用量失败: ' + error.message;
+        return fallback;
     }
 }
 
@@ -404,6 +858,9 @@ function 掩码敏感信息(文本, 前缀长度 = 3, 后缀长度 = 2) {
 ////////////////////////////////HTML页面//////////////////////////////////
 
 async function UsagePanel管理面板(TOKEN) {
+    const userIDMD5 = await MD5MD5(TOKEN);
+    const UUID = [userIDMD5.slice(0, 8), userIDMD5.slice(8, 12), '4' + userIDMD5.slice(13, 16), '8' + userIDMD5.slice(17, 20), userIDMD5.slice(20)].join('-');
+    const 专属ID标识 = 'ed' + userIDMD5.slice(0, 8);
     const html = `
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -453,6 +910,14 @@ async function UsagePanel管理面板(TOKEN) {
         }
 
         * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        html {
+            scrollbar-gutter: stable both-edges;
+        }
+
+        @supports not (scrollbar-gutter: stable) {
+            html { overflow-y: scroll; }
+        }
 
         body {
             font-family: 'Outfit', sans-serif;
@@ -529,6 +994,14 @@ async function UsagePanel管理面板(TOKEN) {
                 0 0 0 1px rgba(255, 255, 255, 0.05) inset;
         }
 
+        .summary-card {
+            position: static;
+        }
+
+        .accounts-card {
+            min-width: 0;
+        }
+
         header {
             margin-bottom: 1.5rem;
         }
@@ -600,6 +1073,34 @@ async function UsagePanel管理面板(TOKEN) {
         .mini-label { font-size: 0.7rem; text-transform: uppercase; color: var(--text-muted); margin-bottom: 0; letter-spacing: 0.05em; font-weight: 500; }
         .mini-value { font-size: 1.25rem; font-weight: 700; color: var(--text-main); line-height: 1.2; }
         .total-text { text-align: right; font-size: 0.8rem; color: var(--text-muted); margin-top: 0.5rem; }
+        .quota-details { margin-top: 1.25rem; overflow: hidden; }
+        .quota-details[open] { display: flex; flex-direction: column; }
+        .quota-details.quota-animating .quota-summary { pointer-events: none; }
+        .quota-summary { list-style: none; background: linear-gradient(135deg, rgba(99, 102, 241, 0.16), rgba(14, 165, 233, 0.1)); border: 1px solid rgba(99, 102, 241, 0.5); border-radius: 14px; padding: 0.8rem 0.85rem; cursor: pointer; display: flex; justify-content: space-between; gap: 0.75rem; align-items: center; color: var(--text-main); font-size: 0.85rem; font-weight: 700; box-shadow: 0 12px 28px -18px var(--primary-glow), inset 0 1px 0 rgba(255,255,255,0.08); transition: all 0.3s ease; }
+        .quota-summary::-webkit-details-marker { display: none; }
+        .quota-summary:hover, .quota-summary:focus-visible { border-color: var(--primary); background: linear-gradient(135deg, rgba(99, 102, 241, 0.24), rgba(14, 165, 233, 0.14)); box-shadow: 0 16px 32px -18px var(--primary-glow), 0 0 0 3px rgba(99, 102, 241, 0.12); outline: none; }
+        .quota-summary-title { min-width: 0; }
+        .quota-summary::after { content: '展开细节'; color: #fff; background: var(--primary); border-radius: 999px; padding: 0.38rem 0.7rem; font-size: 0.75rem; font-weight: 700; white-space: nowrap; box-shadow: 0 10px 20px -12px var(--primary-glow); }
+        .quota-details[open] .quota-summary::after { content: '收起细节'; }
+        .quota-details[open] .quota-summary { order: 2; margin-top: 0.875rem; }
+        .quota-summary-meta { color: var(--text-muted); font-size: 0.75rem; font-weight: 600; margin-left: auto; white-space: nowrap; }
+        .quota-body { overflow: hidden; }
+        .quota-details[open] .quota-body { order: 1; }
+        .quota-details.quota-animating .quota-body { will-change: height, opacity, transform; }
+        .quota-list { display: grid; gap: 0.875rem; margin-top: 0.875rem; }
+        .quota-details[open] .quota-list { margin-top: 0; }
+        .quota-item { background: var(--item-bg); border: 1px solid var(--stroke); border-radius: 14px; padding: 0.875rem 1rem; }
+        .quota-group-head { display: flex; justify-content: space-between; gap: 0.75rem; align-items: center; margin-bottom: 0.75rem; }
+        .quota-group-title { color: var(--text-main); font-size: 0.9rem; font-weight: 700; }
+        .quota-group-meta { color: var(--text-muted); font-size: 0.75rem; font-variant-numeric: tabular-nums; text-align: right; }
+        .quota-row { margin-top: 0.75rem; }
+        .quota-group-head + .quota-row { margin-top: 0; }
+        .quota-top { display: flex; justify-content: space-between; gap: 0.75rem; color: var(--text-muted); font-size: 0.78rem; margin-bottom: 0.55rem; }
+        .quota-title { color: var(--text-main); font-weight: 600; }
+        .quota-meta { text-align: right; font-variant-numeric: tabular-nums; }
+        .quota-track { height: 7px; background: var(--track-bg); border: 1px solid var(--stroke); border-radius: 999px; overflow: hidden; }
+        .quota-fill { height: 100%; border-radius: inherit; min-width: 0; transition: width 1s ease; }
+        .resource-note { margin-top: 0.875rem; color: var(--text-muted); font-size: 0.75rem; line-height: 1.5; }
 
         /* Account List Styles */
         .account-list { display: flex; flex-direction: column; gap: 1rem; }
@@ -721,7 +1222,26 @@ async function UsagePanel管理面板(TOKEN) {
         @keyframes spin { to { transform: rotate(360deg); } }
         .loading-wrap { display: flex; justify-content: center; padding: 3rem; }
 
+        @media (min-width: 1024px) {
+            .top-nav {
+                max-width: 1180px;
+            }
+
+            .container {
+                max-width: 1180px;
+                display: grid;
+                grid-template-columns: minmax(320px, 0.85fr) minmax(520px, 1.15fr);
+                align-items: start;
+            }
+
+            .summary-card {
+                position: sticky;
+                top: 1.5rem;
+            }
+        }
+
         .footer {
+            grid-column: 1 / -1;
             margin-top: 2.5rem;
             text-align: center;
             font-size: 0.75rem;
@@ -769,7 +1289,14 @@ async function UsagePanel管理面板(TOKEN) {
             }
 
             .container {
+                max-width: 680px;
+                display: flex;
+                flex-direction: column;
                 gap: 1.5rem;
+            }
+
+            .summary-card {
+                position: static;
             }
 
             .glass-card {
@@ -885,12 +1412,36 @@ async function UsagePanel管理面板(TOKEN) {
             }
 
             .footer {
+                grid-column: auto;
                 margin-top: 2rem;
                 font-size: 0.7rem;
             }
 
             .total-text {
                 font-size: 0.75rem;
+            }
+
+            .quota-top {
+                flex-direction: column;
+                gap: 0.35rem;
+            }
+
+            .quota-summary, .quota-group-head {
+                align-items: flex-start;
+                flex-direction: column;
+                gap: 0.35rem;
+            }
+
+            .quota-summary-meta {
+                margin-left: 0;
+            }
+
+            .quota-group-meta {
+                text-align: left;
+            }
+
+            .quota-meta {
+                text-align: left;
             }
 
             .account-id {
@@ -955,14 +1506,14 @@ async function UsagePanel管理面板(TOKEN) {
     </div>
 
     <div class="container">
-        <div class="glass-card">
-            <h1>Workers/Pages 请求使用情况</h1>
+        <div class="glass-card summary-card">
+            <h1>Cloudflare 额度汇总</h1>
             <div id="summary-content">
                 <div class="loading-wrap"><div class="loading-spinner"></div></div>
             </div>
         </div>
 
-        <div class="glass-card">
+        <div class="glass-card accounts-card">
             <div class="module-header">
                 <h2>☁️ Cloudflare 账号管理</h2>
                 <button class="add-btn" onclick="openAddModal()">添加账号</button>
@@ -1116,6 +1667,157 @@ async function UsagePanel管理面板(TOKEN) {
             }
         }
 
+        function percentOf(used, limit) {
+            used = Number(used) || 0;
+            limit = Number(limit) || 0;
+            return limit > 0 ? Math.min((used / limit) * 100, 100) : 0;
+        }
+
+        function formatNumber(value) {
+            return (Number(value) || 0).toLocaleString();
+        }
+
+        function formatBytes(bytes) {
+            bytes = Number(bytes) || 0;
+            if (bytes >= 1024 * 1024 * 1024) return (bytes / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+            if (bytes >= 1024 * 1024) return (bytes / 1024 / 1024).toFixed(2) + ' MB';
+            if (bytes >= 1024) return (bytes / 1024).toFixed(2) + ' KB';
+            return bytes.toLocaleString() + ' B';
+        }
+
+        function getResources(data) {
+            return (data && data.resources) || { d1: {}, kv: {}, r2: {} };
+        }
+
+        function renderQuotaBar(label, used, limit, formatter) {
+            formatter = formatter || formatNumber;
+            const percent = percentOf(used, limit);
+            const color = getGradientColor(percent);
+            return '<div class="quota-row">' +
+                '<div class="quota-top">' +
+                    '<span class="quota-title">' + label + '</span>' +
+                    '<span class="quota-meta">' + formatter(used) + ' / ' + formatter(limit) + ' · ' + percent.toFixed(1) + '%</span>' +
+                '</div>' +
+                '<div class="quota-track"><div class="quota-fill" style="width:' + percent + '%; background:' + color + '"></div></div>' +
+            '</div>';
+        }
+
+        function renderQuotaGroup(title, meta, rows) {
+            return '<div class="quota-item">' +
+                '<div class="quota-group-head">' +
+                    '<span class="quota-group-title">' + title + '</span>' +
+                    '<span class="quota-group-meta">' + meta + '</span>' +
+                '</div>' +
+                rows.join('') +
+            '</div>';
+        }
+
+        function renderResourceQuotas(resources) {
+            const d1 = resources.d1 || {};
+            const kv = resources.kv || {};
+            const r2 = resources.r2 || {};
+            return '<details class="quota-details">' +
+                '<summary class="quota-summary"><span class="quota-summary-title">资源额度细节</span><span class="quota-summary-meta">KV / D1 / R2</span></summary>' +
+                '<div class="quota-body"><div class="quota-list">' +
+                    renderQuotaGroup('KV', formatNumber(kv.namespaces || 0) + ' 个命名空间', [
+                        renderQuotaBar('读取（今日）', kv.reads, kv.readsLimit),
+                        renderQuotaBar('写入（今日）', kv.writes, kv.writesLimit),
+                        renderQuotaBar('删除/列表（今日）', (kv.deletes || 0) + (kv.lists || 0), (kv.deletesLimit || 0) + (kv.listsLimit || 0)),
+                        renderQuotaBar('存储', kv.storageBytes, kv.storageLimitBytes, formatBytes)
+                    ]) +
+                    renderQuotaGroup('D1', formatNumber(d1.databases || 0) + ' 个数据库', [
+                        renderQuotaBar('读取（今日）', d1.rowsRead, d1.rowsReadLimit),
+                        renderQuotaBar('写入（今日）', d1.rowsWritten, d1.rowsWrittenLimit),
+                        renderQuotaBar('存储', d1.storageBytes, d1.storageLimitBytes, formatBytes)
+                    ]) +
+                    renderQuotaGroup('R2', formatNumber(r2.buckets || 0) + ' 个存储桶', [
+                        renderQuotaBar('Class A（本月）', r2.classA, r2.classALimit),
+                        renderQuotaBar('Class B（本月）', r2.classB, r2.classBLimit),
+                        renderQuotaBar('存储', r2.storageBytes, r2.storageLimitBytes, formatBytes)
+                    ]) +
+                '</div><div class="resource-note">D1/KV 按 UTC 自然日统计，R2 操作按本月统计；存储为最近一次指标快照。</div></div>' +
+            '</details>';
+        }
+
+        function prefersReducedMotion() {
+            return window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        }
+
+        function isDesktopAdminView() {
+            return window.matchMedia && window.matchMedia('(min-width: 1024px)').matches;
+        }
+
+        function resetQuotaBody(body) {
+            body.style.height = '';
+            body.style.opacity = '';
+            body.style.transform = '';
+            body.style.overflow = '';
+        }
+
+        function animateQuotaDetails(details, opening) {
+            const body = details.querySelector('.quota-body');
+            if (!body || typeof body.animate !== 'function') {
+                details.open = opening;
+                return;
+            }
+
+            details.classList.add('quota-animating');
+            body.style.overflow = 'hidden';
+
+            if (opening) {
+                details.open = true;
+                body.style.height = '0px';
+                body.style.opacity = '0';
+                body.style.transform = 'translateY(6px)';
+            } else {
+                body.style.height = body.scrollHeight + 'px';
+                body.style.opacity = '1';
+                body.style.transform = 'translateY(0)';
+            }
+
+            const startHeight = opening ? 0 : body.scrollHeight;
+            const endHeight = opening ? body.scrollHeight : 0;
+            const animation = body.animate([
+                { height: startHeight + 'px', opacity: opening ? 0 : 1, transform: opening ? 'translateY(6px)' : 'translateY(0)' },
+                { height: endHeight + 'px', opacity: opening ? 1 : 0, transform: opening ? 'translateY(0)' : 'translateY(6px)' }
+            ], {
+                duration: 260,
+                easing: 'cubic-bezier(0.4, 0, 0.2, 1)',
+                fill: 'forwards'
+            });
+
+            animation.onfinish = () => {
+                animation.cancel();
+                if (!opening) details.open = false;
+                resetQuotaBody(body);
+                details.classList.remove('quota-animating');
+            };
+
+            animation.oncancel = () => {
+                resetQuotaBody(body);
+                details.classList.remove('quota-animating');
+            };
+        }
+
+        function bindQuotaDetailsAnimations(scope, defaultOpenOnDesktop = false) {
+            if (!scope) return;
+            scope.querySelectorAll('.quota-details').forEach(details => {
+                if (details.dataset.quotaAnimationBound) return;
+                const summary = details.querySelector('.quota-summary');
+                const body = details.querySelector('.quota-body');
+                if (!summary || !body) return;
+                if (defaultOpenOnDesktop && isDesktopAdminView()) details.open = true;
+
+                details.dataset.quotaAnimationBound = 'true';
+                summary.addEventListener('click', (event) => {
+                    if (prefersReducedMotion() || typeof body.animate !== 'function') return;
+                    event.preventDefault();
+                    if (details.classList.contains('quota-animating')) return;
+                    animateQuotaDetails(details, !details.open);
+                });
+            });
+        }
+
         async function logout() {
             try {
                 await fetch('./api/logout', { method: 'POST' });
@@ -1135,6 +1837,7 @@ async function UsagePanel管理面板(TOKEN) {
                 const total = data.total || 0;
                 const max = data.max || 100000;
                 const percent = Math.min((total / max) * 100, 100).toFixed(1);
+                const resources = getResources(data);
                 
                 container.innerHTML = \`
                     <div class="usage-section">
@@ -1165,7 +1868,9 @@ async function UsagePanel管理面板(TOKEN) {
                             </div>
                         </div>
                     </div>
+                    \${renderResourceQuotas(resources)}
                 \`;
+                bindQuotaDetailsAnimations(container, true);
                 
                 // 应用颜色到百分数
                 const usageSection = container.querySelector('.usage-section');
@@ -1188,10 +1893,12 @@ async function UsagePanel管理面板(TOKEN) {
 
                 container.innerHTML = '<div class="account-list">' + data.map(acc => {
                     const usage = acc.Usage || {};
+                    const resources = getResources(usage);
                     const total = usage.total || 0;
                     const max = usage.max || 100000;
                     const percent = Math.min((total / max) * 100, 100).toFixed(1);
-                    const updateTime = acc.UpdateTime ? new Date(acc.UpdateTime).toLocaleString() : '从未更新';
+                    const updateTimeValue = acc.UpdateTime || acc.LastCheckTime;
+                    const updateTime = updateTimeValue ? new Date(updateTimeValue).toLocaleString() : '从未更新';
                     const percentColor = getGradientColor(percent);
                     const bgSize = percent > 0 ? (100 / percent) * 100 : 100;
                     
@@ -1216,9 +1923,11 @@ async function UsagePanel管理面板(TOKEN) {
                                     <div class="progress-bar" style="width: \${percent}%; --bg-size: \${bgSize}%"></div>
                                 </div>
                             </div>
+                            \${renderResourceQuotas(resources)}
                         </div>
                     \`;
                 }).join('') + '</div>';
+                bindQuotaDetailsAnimations(container);
             } catch (err) {
                 container.innerHTML = '<div style="color: var(--danger)">加载详情数据失败</div>';
             }
@@ -1335,7 +2044,7 @@ async function UsagePanel主页(TOKEN) {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Cloudflare Workers/Pages 请求数使用统计</title>
+    <title>Cloudflare 额度使用统计</title>
     <link rel="icon" href="https://cf-assets.www.cloudflare.com/dzlvafdwdttg/5uhbWfhjepEoUiM9phzhgJ/9658369030266cde9e35a3c5d4e4beb2/cloud-upload.svg">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -1374,6 +2083,14 @@ async function UsagePanel主页(TOKEN) {
         }
 
         * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        html {
+            scrollbar-gutter: stable both-edges;
+        }
+
+        @supports not (scrollbar-gutter: stable) {
+            html { overflow-y: scroll; }
+        }
 
         body {
             font-family: 'Outfit', sans-serif;
@@ -1569,6 +2286,35 @@ async function UsagePanel主页(TOKEN) {
             margin-top: 0.5rem;
             font-variant-numeric: tabular-nums;
         }
+
+        .quota-details { margin-top: 1.25rem; overflow: hidden; }
+        .quota-details[open] { display: flex; flex-direction: column; }
+        .quota-details.quota-animating .quota-summary { pointer-events: none; }
+        .quota-summary { list-style: none; background: linear-gradient(135deg, rgba(99, 102, 241, 0.16), rgba(14, 165, 233, 0.1)); border: 1px solid rgba(99, 102, 241, 0.5); border-radius: 14px; padding: 0.8rem 0.85rem; cursor: pointer; display: flex; justify-content: space-between; gap: 0.75rem; align-items: center; color: var(--text-main); font-size: 0.85rem; font-weight: 700; box-shadow: 0 12px 28px -18px var(--primary-glow), inset 0 1px 0 rgba(255,255,255,0.08); transition: all 0.3s ease; }
+        .quota-summary::-webkit-details-marker { display: none; }
+        .quota-summary:hover, .quota-summary:focus-visible { border-color: var(--primary); background: linear-gradient(135deg, rgba(99, 102, 241, 0.24), rgba(14, 165, 233, 0.14)); box-shadow: 0 16px 32px -18px var(--primary-glow), 0 0 0 3px rgba(99, 102, 241, 0.12); outline: none; }
+        .quota-summary-title { min-width: 0; }
+        .quota-summary::after { content: '展开细节'; color: #fff; background: var(--primary); border-radius: 999px; padding: 0.38rem 0.7rem; font-size: 0.75rem; font-weight: 700; white-space: nowrap; box-shadow: 0 10px 20px -12px var(--primary-glow); }
+        .quota-details[open] .quota-summary::after { content: '收起细节'; }
+        .quota-details[open] .quota-summary { order: 2; margin-top: 0.875rem; }
+        .quota-summary-meta { color: var(--text-muted); font-size: 0.75rem; font-weight: 600; margin-left: auto; white-space: nowrap; }
+        .quota-body { overflow: hidden; }
+        .quota-details[open] .quota-body { order: 1; }
+        .quota-details.quota-animating .quota-body { will-change: height, opacity, transform; }
+        .quota-list { display: grid; gap: 0.875rem; margin-top: 0.875rem; }
+        .quota-details[open] .quota-list { margin-top: 0; }
+        .quota-item { background: var(--item-bg); border: 1px solid var(--stroke); border-radius: 14px; padding: 0.875rem 1rem; }
+        .quota-group-head { display: flex; justify-content: space-between; gap: 0.75rem; align-items: center; margin-bottom: 0.75rem; }
+        .quota-group-title { color: var(--text-main); font-size: 0.9rem; font-weight: 700; }
+        .quota-group-meta { color: var(--text-muted); font-size: 0.75rem; font-variant-numeric: tabular-nums; text-align: right; }
+        .quota-row { margin-top: 0.75rem; }
+        .quota-group-head + .quota-row { margin-top: 0; }
+        .quota-top { display: flex; justify-content: space-between; gap: 0.75rem; color: var(--text-muted); font-size: 0.78rem; margin-bottom: 0.55rem; }
+        .quota-title { color: var(--text-main); font-weight: 600; }
+        .quota-meta { text-align: right; font-variant-numeric: tabular-nums; }
+        .quota-track { height: 7px; background: var(--track-bg); border: 1px solid var(--stroke); border-radius: 999px; overflow: hidden; }
+        .quota-fill { height: 100%; border-radius: inherit; min-width: 0; transition: width 1s ease; }
+        .resource-note { margin-top: 0.875rem; color: var(--text-muted); font-size: 0.75rem; line-height: 1.5; }
 
         .footer {
             margin-top: 2.5rem;
@@ -1962,6 +2708,29 @@ async function UsagePanel主页(TOKEN) {
                 margin-top: 0.375rem;
             }
 
+            .quota-top {
+                flex-direction: column;
+                gap: 0.35rem;
+            }
+
+            .quota-summary, .quota-group-head {
+                align-items: flex-start;
+                flex-direction: column;
+                gap: 0.35rem;
+            }
+
+            .quota-summary-meta {
+                margin-left: 0;
+            }
+
+            .quota-group-meta {
+                text-align: left;
+            }
+
+            .quota-meta {
+                text-align: left;
+            }
+
             .footer {
                 margin-top: 2rem;
                 font-size: 0.7rem;
@@ -2285,7 +3054,7 @@ async function UsagePanel主页(TOKEN) {
     <div class="container">
         <div class="glass-card">
             <header>
-                <h1>☁️ Workers/Pages 请求数统计</h1>
+                <h1>☁️ Cloudflare 额度统计</h1>
                 <div class="status-badge">
                     <div class="status-dot"></div>
                     <span>System Online</span>
@@ -2374,6 +3143,152 @@ async function UsagePanel主页(TOKEN) {
             }
         }
 
+        function percentOf(used, limit) {
+            used = Number(used) || 0;
+            limit = Number(limit) || 0;
+            return limit > 0 ? Math.min((used / limit) * 100, 100) : 0;
+        }
+
+        function formatNumber(value) {
+            return (Number(value) || 0).toLocaleString();
+        }
+
+        function formatBytes(bytes) {
+            bytes = Number(bytes) || 0;
+            if (bytes >= 1024 * 1024 * 1024) return (bytes / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+            if (bytes >= 1024 * 1024) return (bytes / 1024 / 1024).toFixed(2) + ' MB';
+            if (bytes >= 1024) return (bytes / 1024).toFixed(2) + ' KB';
+            return bytes.toLocaleString() + ' B';
+        }
+
+        function getResources(data) {
+            return (data && data.resources) || { d1: {}, kv: {}, r2: {} };
+        }
+
+        function renderQuotaBar(label, used, limit, formatter) {
+            formatter = formatter || formatNumber;
+            const percent = percentOf(used, limit);
+            const color = getGradientColor(percent);
+            return '<div class="quota-row">' +
+                '<div class="quota-top">' +
+                    '<span class="quota-title">' + label + '</span>' +
+                    '<span class="quota-meta">' + formatter(used) + ' / ' + formatter(limit) + ' · ' + percent.toFixed(1) + '%</span>' +
+                '</div>' +
+                '<div class="quota-track"><div class="quota-fill" style="width:' + percent + '%; background:' + color + '"></div></div>' +
+            '</div>';
+        }
+
+        function renderQuotaGroup(title, meta, rows) {
+            return '<div class="quota-item">' +
+                '<div class="quota-group-head">' +
+                    '<span class="quota-group-title">' + title + '</span>' +
+                    '<span class="quota-group-meta">' + meta + '</span>' +
+                '</div>' +
+                rows.join('') +
+            '</div>';
+        }
+
+        function renderResourceQuotas(resources) {
+            const d1 = resources.d1 || {};
+            const kv = resources.kv || {};
+            const r2 = resources.r2 || {};
+            return '<details class="quota-details">' +
+                '<summary class="quota-summary"><span class="quota-summary-title">资源额度细节</span><span class="quota-summary-meta">KV / D1 / R2</span></summary>' +
+                '<div class="quota-body"><div class="quota-list">' +
+                    renderQuotaGroup('KV', formatNumber(kv.namespaces || 0) + ' 个命名空间', [
+                        renderQuotaBar('读取（今日）', kv.reads, kv.readsLimit),
+                        renderQuotaBar('写入（今日）', kv.writes, kv.writesLimit),
+                        renderQuotaBar('删除/列表（今日）', (kv.deletes || 0) + (kv.lists || 0), (kv.deletesLimit || 0) + (kv.listsLimit || 0)),
+                        renderQuotaBar('存储', kv.storageBytes, kv.storageLimitBytes, formatBytes)
+                    ]) +
+                    renderQuotaGroup('D1', formatNumber(d1.databases || 0) + ' 个数据库', [
+                        renderQuotaBar('读取（今日）', d1.rowsRead, d1.rowsReadLimit),
+                        renderQuotaBar('写入（今日）', d1.rowsWritten, d1.rowsWrittenLimit),
+                        renderQuotaBar('存储', d1.storageBytes, d1.storageLimitBytes, formatBytes)
+                    ]) +
+                    renderQuotaGroup('R2', formatNumber(r2.buckets || 0) + ' 个存储桶', [
+                        renderQuotaBar('Class A（本月）', r2.classA, r2.classALimit),
+                        renderQuotaBar('Class B（本月）', r2.classB, r2.classBLimit),
+                        renderQuotaBar('存储', r2.storageBytes, r2.storageLimitBytes, formatBytes)
+                    ]) +
+                '</div><div class="resource-note">D1/KV 按 UTC 自然日统计，R2 操作按本月统计；存储为最近一次指标快照。</div></div>' +
+            '</details>';
+        }
+
+        function prefersReducedMotion() {
+            return window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        }
+
+        function resetQuotaBody(body) {
+            body.style.height = '';
+            body.style.opacity = '';
+            body.style.transform = '';
+            body.style.overflow = '';
+        }
+
+        function animateQuotaDetails(details, opening) {
+            const body = details.querySelector('.quota-body');
+            if (!body || typeof body.animate !== 'function') {
+                details.open = opening;
+                return;
+            }
+
+            details.classList.add('quota-animating');
+            body.style.overflow = 'hidden';
+
+            if (opening) {
+                details.open = true;
+                body.style.height = '0px';
+                body.style.opacity = '0';
+                body.style.transform = 'translateY(6px)';
+            } else {
+                body.style.height = body.scrollHeight + 'px';
+                body.style.opacity = '1';
+                body.style.transform = 'translateY(0)';
+            }
+
+            const startHeight = opening ? 0 : body.scrollHeight;
+            const endHeight = opening ? body.scrollHeight : 0;
+            const animation = body.animate([
+                { height: startHeight + 'px', opacity: opening ? 0 : 1, transform: opening ? 'translateY(6px)' : 'translateY(0)' },
+                { height: endHeight + 'px', opacity: opening ? 1 : 0, transform: opening ? 'translateY(0)' : 'translateY(6px)' }
+            ], {
+                duration: 260,
+                easing: 'cubic-bezier(0.4, 0, 0.2, 1)',
+                fill: 'forwards'
+            });
+
+            animation.onfinish = () => {
+                animation.cancel();
+                if (!opening) details.open = false;
+                resetQuotaBody(body);
+                details.classList.remove('quota-animating');
+            };
+
+            animation.oncancel = () => {
+                resetQuotaBody(body);
+                details.classList.remove('quota-animating');
+            };
+        }
+
+        function bindQuotaDetailsAnimations(scope) {
+            if (!scope) return;
+            scope.querySelectorAll('.quota-details').forEach(details => {
+                if (details.dataset.quotaAnimationBound) return;
+                const summary = details.querySelector('.quota-summary');
+                const body = details.querySelector('.quota-body');
+                if (!summary || !body) return;
+
+                details.dataset.quotaAnimationBound = 'true';
+                summary.addEventListener('click', (event) => {
+                    if (prefersReducedMotion() || typeof body.animate !== 'function') return;
+                    event.preventDefault();
+                    if (details.classList.contains('quota-animating')) return;
+                    animateQuotaDetails(details, !details.open);
+                });
+            });
+        }
+
         async function fetchUsage() {
             const content = document.getElementById('content');
             try {
@@ -2392,6 +3307,7 @@ async function UsagePanel主页(TOKEN) {
                 const total = data.total || 0;
                 const max = data.max || 100000;
                 const percent = Math.min((total / max) * 100, 100).toFixed(1);
+                const resources = getResources(data);
                 
                 content.innerHTML = \`
                     <div class="usage-section">
@@ -2423,7 +3339,9 @@ async function UsagePanel主页(TOKEN) {
                             </div>
                         </div>
                     </div>
+                    \${renderResourceQuotas(resources)}
                 \`;
+                bindQuotaDetailsAnimations(content);
 
                 // Animate progress bar and apply colors
                 requestAnimationFrame(() => {
